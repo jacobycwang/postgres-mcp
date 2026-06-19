@@ -56,6 +56,8 @@ class AccessMode(str, Enum):
 # Global variables
 db_connection = DbConnPool()
 current_access_mode = AccessMode.UNRESTRICTED
+# Optional estimated-cost ceiling for execute_sql. None disables the check.
+max_query_cost: float | None = None
 shutdown_in_progress = False
 
 
@@ -411,12 +413,65 @@ If there is no hypothetical index, you can pass an empty list.""",
         return format_error_response(str(e))
 
 
+async def estimate_query_cost(sql_driver: Union[SqlDriver, SafeSqlDriver], sql: str) -> float | None:
+    """Estimate the planner total cost for a SQL query via EXPLAIN.
+
+    Returns the estimated total cost, or None if the cost cannot be determined
+    (e.g. the statement cannot be planned, such as some DDL or multi-statement input).
+    """
+    explain_tool = ExplainPlanTool(sql_driver=sql_driver)
+    result = await explain_tool.explain(sql)
+    if isinstance(result, ExplainPlanArtifact):
+        return result.plan_tree.total_cost
+    logger.debug(f"Could not estimate query cost: {result.to_text() if isinstance(result, ErrorResult) else result}")
+    return None
+
+
+async def enforce_cost_limit(sql: str, force: bool) -> str | None:
+    """Check a query against the configured cost limit.
+
+    Returns an error message string if the query should be rejected, or None if
+    it is allowed to run. No-op when the cost limit is disabled or force is set.
+    """
+    if max_query_cost is None or force:
+        return None
+
+    sql_driver = await get_sql_driver()
+    cost = await estimate_query_cost(sql_driver, sql)
+
+    if cost is None:
+        # fail-closed: a query whose cost we cannot determine is not allowed
+        # through unless the caller explicitly forces it.
+        return (
+            f"Could not estimate the cost of this query, so it was blocked by the "
+            f"cost limit (max {max_query_cost:.2f}). If you really need to run it, "
+            f"call again with force=true."
+        )
+
+    if cost > max_query_cost:
+        return (
+            f"Estimated query cost {cost:.2f} exceeds the configured limit of "
+            f"{max_query_cost:.2f}. This query was blocked to protect the database. "
+            f"If you really need to run it, call again with force=true."
+        )
+
+    return None
+
+
 # Query function declaration without the decorator - we'll add it dynamically based on access mode
 async def execute_sql(
     sql: str = Field(description="SQL to run", default="all"),
+    force: bool = Field(
+        description="Set to true to bypass the estimated cost limit check and run the query anyway.",
+        default=False,
+    ),
 ) -> ResponseType:
     """Executes a SQL query against the database."""
     try:
+        rejection = await enforce_cost_limit(sql, force)
+        if rejection is not None:
+            return format_error_response(rejection)
+
         sql_driver = await get_sql_driver()
         rows = await sql_driver.execute_query(sql)  # type: ignore
         if rows is None:
@@ -566,6 +621,13 @@ async def main():
         help="Set SQL access mode: unrestricted (unrestricted) or restricted (read-only with protections)",
     )
     parser.add_argument(
+        "--max-query-cost",
+        type=float,
+        default=None,
+        help="Optional estimated-cost ceiling for execute_sql. When set, each query is run through "
+        "EXPLAIN first and rejected if its estimated total cost exceeds this value (unless force=true is passed).",
+    )
+    parser.add_argument(
         "--transport",
         type=str,
         choices=["stdio", "sse", "streamable-http"],
@@ -603,11 +665,22 @@ async def main():
     global current_access_mode
     current_access_mode = AccessMode(args.access_mode)
 
+    # Store the optional cost limit in the global variable
+    global max_query_cost
+    max_query_cost = args.max_query_cost
+
+    cost_limit_note = ""
+    if max_query_cost is not None:
+        cost_limit_note = (
+            f" Queries whose estimated cost exceeds {max_query_cost:.2f} are blocked to protect the database; "
+            f"pass force=true to run them anyway."
+        )
+
     # Add the query tool with a description and annotations appropriate to the access mode
     if current_access_mode == AccessMode.UNRESTRICTED:
         mcp.add_tool(
             execute_sql,
-            description="Execute any SQL query",
+            description="Execute any SQL query." + cost_limit_note,
             annotations=ToolAnnotations(
                 title="Execute SQL",
                 destructiveHint=True,
@@ -616,7 +689,7 @@ async def main():
     else:
         mcp.add_tool(
             execute_sql,
-            description="Execute a read-only SQL query",
+            description="Execute a read-only SQL query." + cost_limit_note,
             annotations=ToolAnnotations(
                 title="Execute SQL (Read-Only)",
                 readOnlyHint=True,
