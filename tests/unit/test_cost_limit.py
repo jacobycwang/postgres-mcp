@@ -6,6 +6,7 @@ import pytest
 
 import postgres_mcp.server as server
 from postgres_mcp.artifacts import ErrorResult
+from postgres_mcp.artifacts import ExplainExecutionError
 from postgres_mcp.artifacts import ExplainPlanArtifact
 from postgres_mcp.artifacts import PlanNode
 
@@ -45,17 +46,28 @@ async def test_estimate_query_cost_returns_total_cost(expected_cost):
     """estimate_query_cost returns the plan tree total cost from EXPLAIN."""
     driver = MagicMock()
     with patch.object(server.ExplainPlanTool, "explain", new=AsyncMock(return_value=make_artifact(expected_cost))):
-        cost = await server.estimate_query_cost(driver, "SELECT * FROM t")
-    assert cost == expected_cost
+        estimate = await server.estimate_query_cost(driver, "SELECT * FROM t")
+    assert estimate == server.CostEstimate(cost=expected_cost, explain_error=None)
 
 
 @pytest.mark.asyncio
-async def test_estimate_query_cost_returns_none_on_error():
-    """estimate_query_cost returns None when EXPLAIN cannot produce a plan."""
+async def test_estimate_query_cost_returns_none_on_unparseable_plan():
+    """estimate_query_cost reports no cost and no error when the plan yields no cost."""
     driver = MagicMock()
     with patch.object(server.ExplainPlanTool, "explain", new=AsyncMock(return_value=ErrorResult("cannot explain"))):
-        cost = await server.estimate_query_cost(driver, "CREATE TABLE t (id int)")
-    assert cost is None
+        estimate = await server.estimate_query_cost(driver, "CREATE TABLE t (id int)")
+    assert estimate == server.CostEstimate(cost=None, explain_error=None)
+
+
+@pytest.mark.asyncio
+async def test_estimate_query_cost_surfaces_explain_error():
+    """estimate_query_cost carries the database message when EXPLAIN itself failed."""
+    driver = MagicMock()
+    db_error = 'relation "branches" does not exist\nLINE 1: SELECT * FROM branches'
+    explain_result = ExplainExecutionError(f"Error executing explain plan: {db_error}", db_error=db_error)
+    with patch.object(server.ExplainPlanTool, "explain", new=AsyncMock(return_value=explain_result)):
+        estimate = await server.estimate_query_cost(driver, "SELECT * FROM branches")
+    assert estimate == server.CostEstimate(cost=None, explain_error=db_error)
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +97,7 @@ async def test_execute_sql_under_limit_executes(mock_sql_driver):
     with (
         patch("postgres_mcp.server.max_query_cost", 1000.0),
         patch("postgres_mcp.server.get_sql_driver", new=AsyncMock(return_value=mock_sql_driver)),
-        patch("postgres_mcp.server.estimate_query_cost", new=AsyncMock(return_value=250.0)),
+        patch("postgres_mcp.server.estimate_query_cost", new=AsyncMock(return_value=server.CostEstimate(cost=250.0))),
     ):
         result = await server.execute_sql("SELECT 1", force=False)
 
@@ -99,7 +111,7 @@ async def test_execute_sql_over_limit_rejected(mock_sql_driver):
     with (
         patch("postgres_mcp.server.max_query_cost", 1000.0),
         patch("postgres_mcp.server.get_sql_driver", new=AsyncMock(return_value=mock_sql_driver)),
-        patch("postgres_mcp.server.estimate_query_cost", new=AsyncMock(return_value=5000.0)),
+        patch("postgres_mcp.server.estimate_query_cost", new=AsyncMock(return_value=server.CostEstimate(cost=5000.0))),
     ):
         result = await server.execute_sql("SELECT * FROM huge_table", force=False)
 
@@ -115,7 +127,7 @@ async def test_execute_sql_at_limit_executes(mock_sql_driver):
     with (
         patch("postgres_mcp.server.max_query_cost", 1000.0),
         patch("postgres_mcp.server.get_sql_driver", new=AsyncMock(return_value=mock_sql_driver)),
-        patch("postgres_mcp.server.estimate_query_cost", new=AsyncMock(return_value=1000.0)),
+        patch("postgres_mcp.server.estimate_query_cost", new=AsyncMock(return_value=server.CostEstimate(cost=1000.0))),
     ):
         result = await server.execute_sql("SELECT 1", force=False)
 
@@ -145,13 +157,103 @@ async def test_execute_sql_unestimatable_rejected_fail_closed(mock_sql_driver):
     with (
         patch("postgres_mcp.server.max_query_cost", 1000.0),
         patch("postgres_mcp.server.get_sql_driver", new=AsyncMock(return_value=mock_sql_driver)),
-        patch("postgres_mcp.server.estimate_query_cost", new=AsyncMock(return_value=None)),
+        patch("postgres_mcp.server.estimate_query_cost", new=AsyncMock(return_value=server.CostEstimate())),
     ):
         result = await server.execute_sql("CREATE TABLE t (id int)", force=False)
 
     mock_sql_driver.execute_query.assert_not_awaited()
-    assert "Error" in result[0].text
-    assert "force=true" in result[0].text
+    assert result[0].text == (
+        "Error: Could not estimate the cost of this query, so it was blocked by the "
+        "cost limit (max 1000.00). If you really need to run it, call again with force=true."
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_sql_explain_error_reports_database_message(mock_sql_driver):
+    """A query the planner rejected reports the database error, not a cost message."""
+    db_error = 'relation "branches" does not exist'
+    with (
+        patch("postgres_mcp.server.max_query_cost", 1000.0),
+        patch("postgres_mcp.server.get_sql_driver", new=AsyncMock(return_value=mock_sql_driver)),
+        patch(
+            "postgres_mcp.server.estimate_query_cost",
+            new=AsyncMock(return_value=server.CostEstimate(explain_error=db_error)),
+        ),
+    ):
+        result = await server.execute_sql("SELECT * FROM branches", force=False)
+
+    mock_sql_driver.execute_query.assert_not_awaited()
+    assert result[0].text == (
+        "Error: The query could not be planned, so it was not executed. This is a query error, "
+        'not a cost limit; force=true will not help. Database error: relation "branches" does not exist'
+    )
+    assert "cost limit (max" not in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_execute_sql_explain_error_does_not_suggest_force(mock_sql_driver):
+    """The planner-error message never advertises force=true as an escape hatch."""
+    with (
+        patch("postgres_mcp.server.max_query_cost", 1000.0),
+        patch("postgres_mcp.server.get_sql_driver", new=AsyncMock(return_value=mock_sql_driver)),
+        patch(
+            "postgres_mcp.server.estimate_query_cost",
+            new=AsyncMock(return_value=server.CostEstimate(explain_error='syntax error at or near "slect"')),
+        ),
+    ):
+        result = await server.execute_sql("slect 1", force=False)
+
+    assert "force=true will not help" in result[0].text
+    assert "call again with force=true" not in result[0].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
+        "SELECT c.relname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace",
+        "SELECT indexname FROM pg_indexes WHERE tablename = 'branches'",
+    ],
+)
+async def test_execute_sql_introspection_skips_cost_check(mock_sql_driver, sql):
+    """Catalog introspection runs without an EXPLAIN round trip."""
+    estimate = AsyncMock()
+    with (
+        patch("postgres_mcp.server.max_query_cost", 1000.0),
+        patch("postgres_mcp.server.get_sql_driver", new=AsyncMock(return_value=mock_sql_driver)),
+        patch("postgres_mcp.server.estimate_query_cost", new=estimate),
+    ):
+        result = await server.execute_sql(sql, force=False)
+
+    estimate.assert_not_called()
+    mock_sql_driver.execute_query.assert_awaited_once()
+    assert "Error" not in result[0].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM branches LIMIT 5",
+        "SELECT b.name FROM branches b JOIN information_schema.tables t ON t.table_name = b.name",
+        "SELECT count(*) FROM orders",
+    ],
+)
+async def test_execute_sql_user_tables_still_cost_checked(mock_sql_driver, sql):
+    """Anything touching user data is still estimated, including small LIMITs."""
+    with (
+        patch("postgres_mcp.server.max_query_cost", 1000.0),
+        patch("postgres_mcp.server.get_sql_driver", new=AsyncMock(return_value=mock_sql_driver)),
+        patch(
+            "postgres_mcp.server.estimate_query_cost",
+            new=AsyncMock(return_value=server.CostEstimate(cost=8500.0)),
+        ),
+    ):
+        result = await server.execute_sql(sql, force=False)
+
+    mock_sql_driver.execute_query.assert_not_awaited()
+    assert "8500.00" in result[0].text
 
 
 @pytest.mark.asyncio
@@ -160,7 +262,7 @@ async def test_execute_sql_unestimatable_with_force_executes(mock_sql_driver):
     with (
         patch("postgres_mcp.server.max_query_cost", 1000.0),
         patch("postgres_mcp.server.get_sql_driver", new=AsyncMock(return_value=mock_sql_driver)),
-        patch("postgres_mcp.server.estimate_query_cost", new=AsyncMock(return_value=None)),
+        patch("postgres_mcp.server.estimate_query_cost", new=AsyncMock(return_value=server.CostEstimate())),
     ):
         result = await server.execute_sql("CREATE TABLE t (id int)", force=True)
 

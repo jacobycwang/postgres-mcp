@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 
 from ..artifacts import ErrorResult
+from ..artifacts import ExplainExecutionError
 from ..artifacts import ExplainPlanArtifact
 from ..sql import IndexDefinition
 from ..sql import SafeSqlDriver
@@ -180,7 +181,7 @@ class ExplainPlanTool:
             except Exception as e:
                 return ErrorResult(f"Internal error converting explain plan - do not retry: {e}")
         except Exception as e:
-            return ErrorResult(f"Error executing explain plan: {e}")
+            return ExplainExecutionError(f"Error executing explain plan: {e}", db_error=str(e))
 
     async def generate_explain_plan_with_hypothetical_indexes(
         self,

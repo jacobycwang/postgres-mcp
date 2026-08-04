@@ -3,6 +3,7 @@
 from .bind_params import ColumnCollector
 from .bind_params import SqlBindParams
 from .bind_params import TableAliasVisitor
+from .cheap_query import is_catalog_only_query
 from .extension_utils import check_extension
 from .extension_utils import check_hypopg_installation_status
 from .extension_utils import check_postgres_version_requirement
@@ -26,6 +27,7 @@ __all__ = [
     "check_hypopg_installation_status",
     "check_postgres_version_requirement",
     "get_postgres_version",
+    "is_catalog_only_query",
     "obfuscate_password",
     "reset_postgres_version_cache",
 ]

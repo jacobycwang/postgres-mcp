@@ -22,6 +22,17 @@ class ErrorResult:
         self.value = message
 
 
+class ExplainExecutionError(ErrorResult):
+    """An EXPLAIN the database itself rejected (syntax error, missing relation, permission denied, ...).
+
+    db_error holds the raw database message, without the wrapper text.
+    """
+
+    def __init__(self, message: str, db_error: str):
+        super().__init__(message)
+        self.db_error = db_error
+
+
 def calculate_improvement_multiple(base_cost: float, rec_cost: float) -> float:
     """Calculate the improvement multiple from this recommendation."""
     if base_cost <= 0.0:

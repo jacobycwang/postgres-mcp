@@ -9,6 +9,7 @@ from enum import Enum
 from typing import Any
 from typing import List
 from typing import Literal
+from typing import NamedTuple
 from typing import Union
 
 import mcp.types as types
@@ -20,6 +21,7 @@ from pydantic import validate_call
 from postgres_mcp.index.dta_calc import DatabaseTuningAdvisor
 
 from .artifacts import ErrorResult
+from .artifacts import ExplainExecutionError
 from .artifacts import ExplainPlanArtifact
 from .database_health import DatabaseHealthTool
 from .database_health import HealthType
@@ -31,6 +33,7 @@ from .sql import DbConnPool
 from .sql import SafeSqlDriver
 from .sql import SqlDriver
 from .sql import check_hypopg_installation_status
+from .sql import is_catalog_only_query
 from .sql import obfuscate_password
 from .top_queries import TopQueriesCalc
 
@@ -413,18 +416,28 @@ If there is no hypothetical index, you can pass an empty list.""",
         return format_error_response(str(e))
 
 
-async def estimate_query_cost(sql_driver: Union[SqlDriver, SafeSqlDriver], sql: str) -> float | None:
-    """Estimate the planner total cost for a SQL query via EXPLAIN.
+class CostEstimate(NamedTuple):
+    """Outcome of a cost estimation attempt.
 
-    Returns the estimated total cost, or None if the cost cannot be determined
-    (e.g. the statement cannot be planned, such as some DDL or multi-statement input).
+    cost is set when EXPLAIN produced a plan. explain_error carries the raw database
+    message when EXPLAIN itself failed; both are None when a plan came back but no
+    cost could be read from it.
     """
+
+    cost: float | None = None
+    explain_error: str | None = None
+
+
+async def estimate_query_cost(sql_driver: Union[SqlDriver, SafeSqlDriver], sql: str) -> CostEstimate:
+    """Estimate the planner total cost for a SQL query via EXPLAIN."""
     explain_tool = ExplainPlanTool(sql_driver=sql_driver)
     result = await explain_tool.explain(sql)
     if isinstance(result, ExplainPlanArtifact):
-        return result.plan_tree.total_cost
+        return CostEstimate(cost=result.plan_tree.total_cost)
+    if isinstance(result, ExplainExecutionError):
+        return CostEstimate(explain_error=result.db_error)
     logger.debug(f"Could not estimate query cost: {result.to_text() if isinstance(result, ErrorResult) else result}")
-    return None
+    return CostEstimate()
 
 
 async def enforce_cost_limit(sql: str, force: bool) -> str | None:
@@ -436,8 +449,20 @@ async def enforce_cost_limit(sql: str, force: bool) -> str | None:
     if max_query_cost is None or force:
         return None
 
+    # Catalog introspection is bounded by catalog size, so it never needs an estimate.
+    if is_catalog_only_query(sql):
+        return None
+
     sql_driver = await get_sql_driver()
-    cost = await estimate_query_cost(sql_driver, sql)
+    cost, explain_error = await estimate_query_cost(sql_driver, sql)
+
+    if explain_error is not None:
+        # The query is broken, not expensive: report what the database said and do
+        # not offer force=true, which would only re-run the same failing query.
+        return (
+            f"The query could not be planned, so it was not executed. This is a query error, "
+            f"not a cost limit; force=true will not help. Database error: {explain_error}"
+        )
 
     if cost is None:
         # fail-closed: a query whose cost we cannot determine is not allowed
@@ -673,7 +698,7 @@ async def main():
     if max_query_cost is not None:
         cost_limit_note = (
             f" Queries whose estimated cost exceeds {max_query_cost:.2f} are blocked to protect the database; "
-            f"pass force=true to run them anyway."
+            f"pass force=true to run them anyway. Queries reading only information_schema or pg_catalog are exempt."
         )
 
     # Add the query tool with a description and annotations appropriate to the access mode
