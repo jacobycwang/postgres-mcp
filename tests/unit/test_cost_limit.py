@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import pytest
+from mcp.types import TextContent
 
 import postgres_mcp.server as server
 from postgres_mcp.artifacts import ErrorResult
@@ -14,6 +15,12 @@ from postgres_mcp.artifacts import PlanNode
 class MockCell:
     def __init__(self, data):
         self.cells = data
+
+
+def text_of(result) -> str:
+    content = result[0]
+    assert isinstance(content, TextContent)
+    return content.text
 
 
 def make_artifact(total_cost: float) -> ExplainPlanArtifact:
@@ -88,7 +95,7 @@ async def test_execute_sql_disabled_skips_explain(mock_sql_driver):
 
     estimate.assert_not_called()
     mock_sql_driver.execute_query.assert_awaited_once()
-    assert "Error" not in result[0].text
+    assert "Error" not in text_of(result)
 
 
 @pytest.mark.asyncio
@@ -102,7 +109,7 @@ async def test_execute_sql_under_limit_executes(mock_sql_driver):
         result = await server.execute_sql("SELECT 1", force=False)
 
     mock_sql_driver.execute_query.assert_awaited_once()
-    assert "Error" not in result[0].text
+    assert "Error" not in text_of(result)
 
 
 @pytest.mark.asyncio
@@ -116,9 +123,9 @@ async def test_execute_sql_over_limit_rejected(mock_sql_driver):
         result = await server.execute_sql("SELECT * FROM huge_table", force=False)
 
     mock_sql_driver.execute_query.assert_not_awaited()
-    assert "Error" in result[0].text
-    assert "force=true" in result[0].text
-    assert "5000.00" in result[0].text
+    assert "Error" in text_of(result)
+    assert "force=true" in text_of(result)
+    assert "5000.00" in text_of(result)
 
 
 @pytest.mark.asyncio
@@ -132,7 +139,7 @@ async def test_execute_sql_at_limit_executes(mock_sql_driver):
         result = await server.execute_sql("SELECT 1", force=False)
 
     mock_sql_driver.execute_query.assert_awaited_once()
-    assert "Error" not in result[0].text
+    assert "Error" not in text_of(result)
 
 
 @pytest.mark.asyncio
@@ -148,7 +155,7 @@ async def test_execute_sql_force_bypasses_check(mock_sql_driver):
 
     estimate.assert_not_called()
     mock_sql_driver.execute_query.assert_awaited_once()
-    assert "Error" not in result[0].text
+    assert "Error" not in text_of(result)
 
 
 @pytest.mark.asyncio
@@ -162,7 +169,7 @@ async def test_execute_sql_unestimatable_rejected_fail_closed(mock_sql_driver):
         result = await server.execute_sql("CREATE TABLE t (id int)", force=False)
 
     mock_sql_driver.execute_query.assert_not_awaited()
-    assert result[0].text == (
+    assert text_of(result) == (
         "Error: Could not estimate the cost of this query, so it was blocked by the "
         "cost limit (max 1000.00). If you really need to run it, call again with force=true."
     )
@@ -183,11 +190,11 @@ async def test_execute_sql_explain_error_reports_database_message(mock_sql_drive
         result = await server.execute_sql("SELECT * FROM branches", force=False)
 
     mock_sql_driver.execute_query.assert_not_awaited()
-    assert result[0].text == (
+    assert text_of(result) == (
         "Error: The query could not be planned, so it was not executed. This is a query error, "
         'not a cost limit; force=true will not help. Database error: relation "branches" does not exist'
     )
-    assert "cost limit (max" not in result[0].text
+    assert "cost limit (max" not in text_of(result)
 
 
 @pytest.mark.asyncio
@@ -203,8 +210,8 @@ async def test_execute_sql_explain_error_does_not_suggest_force(mock_sql_driver)
     ):
         result = await server.execute_sql("slect 1", force=False)
 
-    assert "force=true will not help" in result[0].text
-    assert "call again with force=true" not in result[0].text
+    assert "force=true will not help" in text_of(result)
+    assert "call again with force=true" not in text_of(result)
 
 
 @pytest.mark.asyncio
@@ -228,7 +235,7 @@ async def test_execute_sql_introspection_skips_cost_check(mock_sql_driver, sql):
 
     estimate.assert_not_called()
     mock_sql_driver.execute_query.assert_awaited_once()
-    assert "Error" not in result[0].text
+    assert "Error" not in text_of(result)
 
 
 @pytest.mark.asyncio
@@ -253,7 +260,7 @@ async def test_execute_sql_user_tables_still_cost_checked(mock_sql_driver, sql):
         result = await server.execute_sql(sql, force=False)
 
     mock_sql_driver.execute_query.assert_not_awaited()
-    assert "8500.00" in result[0].text
+    assert "8500.00" in text_of(result)
 
 
 @pytest.mark.asyncio
@@ -267,4 +274,4 @@ async def test_execute_sql_unestimatable_with_force_executes(mock_sql_driver):
         result = await server.execute_sql("CREATE TABLE t (id int)", force=True)
 
     mock_sql_driver.execute_query.assert_awaited_once()
-    assert "Error" not in result[0].text
+    assert "Error" not in text_of(result)
