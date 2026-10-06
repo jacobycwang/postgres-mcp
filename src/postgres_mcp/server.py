@@ -653,6 +653,12 @@ async def main():
         "EXPLAIN first and rejected if its estimated total cost exceeds this value (unless force=true is passed).",
     )
     parser.add_argument(
+        "--statement-timeout",
+        type=float,
+        default=20,
+        help="Server-side statement_timeout in seconds for every query on the pool (default: 20). Set to 0 to keep the role/database default.",
+    )
+    parser.add_argument(
         "--transport",
         type=str,
         choices=["stdio", "sse", "streamable-http"],
@@ -689,6 +695,9 @@ async def main():
     # Store the access mode in the global variable
     global current_access_mode
     current_access_mode = AccessMode(args.access_mode)
+
+    # 0 means "do not override": the role/database statement_timeout applies
+    db_connection.statement_timeout_ms = int(args.statement_timeout * 1000) if args.statement_timeout > 0 else None
 
     # Store the optional cost limit in the global variable
     global max_query_cost

@@ -62,8 +62,10 @@ def obfuscate_password(text: str | None) -> str | None:
 class DbConnPool:
     """Database connection manager using psycopg's connection pool."""
 
-    def __init__(self, connection_url: Optional[str] = None):
+    def __init__(self, connection_url: Optional[str] = None, statement_timeout_ms: Optional[int] = None):
         self.connection_url = connection_url
+        # Server-side statement_timeout set on every pooled connection; None keeps the role/database default.
+        self.statement_timeout_ms = statement_timeout_ms
         self.pool: AsyncConnectionPool | None = None
         self._is_valid = False
         self._last_error = None
@@ -91,6 +93,7 @@ class DbConnPool:
                 min_size=1,
                 max_size=5,
                 open=False,  # Don't connect immediately, let's do it explicitly
+                kwargs=self._connection_kwargs(),
             )
 
             # Open the pool explicitly
@@ -112,6 +115,12 @@ class DbConnPool:
             await self.close()
 
             raise ValueError(f"Connection attempt failed: {obfuscate_password(str(e))}") from e
+
+    def _connection_kwargs(self) -> Dict[str, Any]:
+        """Extra libpq connection parameters applied to every pooled connection."""
+        if self.statement_timeout_ms is None:
+            return {}
+        return {"options": f"-c statement_timeout={self.statement_timeout_ms}"}
 
     async def close(self) -> None:
         """Close the connection pool."""
