@@ -93,7 +93,7 @@ class DbConnPool:
                 min_size=1,
                 max_size=5,
                 open=False,  # Don't connect immediately, let's do it explicitly
-                kwargs=self._connection_kwargs(),
+                kwargs=self.connection_kwargs(),
             )
 
             # Open the pool explicitly
@@ -116,7 +116,7 @@ class DbConnPool:
 
             raise ValueError(f"Connection attempt failed: {obfuscate_password(str(e))}") from e
 
-    def _connection_kwargs(self) -> Dict[str, Any]:
+    def connection_kwargs(self) -> Dict[str, Any]:
         """Extra libpq connection parameters applied to every pooled connection."""
         if self.statement_timeout_ms is None:
             return {}

@@ -214,13 +214,13 @@ async def test_connection_url_property():
     assert db_pool.connection_url == "postgresql://newuser:newpass@otherhost/otherdb"
 
 
-def test_connection_kwargs_sets_statement_timeout():
+def testconnection_kwargs_sets_statement_timeout():
     """The configured statement_timeout is passed to every pooled connection."""
     db_pool = DbConnPool("postgresql://user:pass@localhost/db", statement_timeout_ms=20000)
-    assert db_pool._connection_kwargs() == {"options": "-c statement_timeout=20000"}
+    assert db_pool.connection_kwargs() == {"options": "-c statement_timeout=20000"}
 
 
-def test_connection_kwargs_without_statement_timeout():
+def testconnection_kwargs_without_statement_timeout():
     """Without a statement_timeout the role/database default is left alone."""
     db_pool = DbConnPool("postgresql://user:pass@localhost/db")
-    assert db_pool._connection_kwargs() == {}
+    assert db_pool.connection_kwargs() == {}
