@@ -1,5 +1,6 @@
 import pytest
 
+from postgres_mcp.sql import calls_sleep
 from postgres_mcp.sql import is_catalog_only_query
 
 
@@ -45,3 +46,30 @@ def test_catalog_introspection_is_cheap(sql):
 )
 def test_non_catalog_queries_are_not_cheap(sql):
     assert is_catalog_only_query(sql) is False
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT pg_sleep(45)",
+        "select PG_SLEEP(1)::text, (select count(*) from reservation)",
+        "SELECT pg_catalog.pg_sleep_for('5 seconds')",
+        "WITH w AS (SELECT pg_sleep_until(now() + interval '1 minute')) SELECT * FROM w",
+        "SELECT 1; SELECT pg_sleep(1)",
+        "SELECT pg_sleep(1) FROM",
+    ],
+)
+def test_sleep_calls_detected(sql):
+    assert calls_sleep(sql) is True
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT count(*) FROM reservation",
+        "SELECT 'pg_sleep(1)' AS literal",
+        "SELECT pg_sleep_count FROM stats",
+    ],
+)
+def test_non_sleep_queries_pass(sql):
+    assert calls_sleep(sql) is False

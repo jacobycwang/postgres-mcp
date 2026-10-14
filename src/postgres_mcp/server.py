@@ -32,6 +32,7 @@ from .index.presentation import TextPresentation
 from .sql import DbConnPool
 from .sql import SafeSqlDriver
 from .sql import SqlDriver
+from .sql import calls_sleep
 from .sql import check_hypopg_installation_status
 from .sql import is_catalog_only_query
 from .sql import obfuscate_password
@@ -61,6 +62,10 @@ db_connection = DbConnPool()
 current_access_mode = AccessMode.UNRESTRICTED
 # Optional estimated-cost ceiling for execute_sql. None disables the check.
 max_query_cost: float | None = None
+# Whether execute_sql exposes force=true to skip the cost check.
+allow_force = True
+# Optional guidance appended to cost-limit rejections, e.g. where heavy queries should go instead.
+cost_limit_hint: str | None = None
 shutdown_in_progress = False
 
 
@@ -440,13 +445,26 @@ async def estimate_query_cost(sql_driver: Union[SqlDriver, SafeSqlDriver], sql: 
     return CostEstimate()
 
 
+SLEEP_REJECTION = (
+    "pg_sleep is not allowed: it holds a database connection while doing nothing. To wait or poll, sleep on the client side between queries."
+)
+
+
+def cost_limit_advice() -> str:
+    """What a caller blocked by the cost limit can do next."""
+    if allow_force:
+        return "If you really need to run it, call again with force=true."
+    return cost_limit_hint or "Narrow the query (indexed filters, a shorter time range) and try again."
+
+
 async def enforce_cost_limit(sql: str, force: bool) -> str | None:
     """Check a query against the configured cost limit.
 
     Returns an error message string if the query should be rejected, or None if
-    it is allowed to run. No-op when the cost limit is disabled or force is set.
+    it is allowed to run. No-op when the cost limit is disabled, or when force is
+    set and allowed.
     """
-    if max_query_cost is None or force:
+    if max_query_cost is None or (force and allow_force):
         return None
 
     # Catalog introspection is bounded by catalog size, so it never needs an estimate.
@@ -467,17 +485,13 @@ async def enforce_cost_limit(sql: str, force: bool) -> str | None:
     if cost is None:
         # fail-closed: a query whose cost we cannot determine is not allowed
         # through unless the caller explicitly forces it.
-        return (
-            f"Could not estimate the cost of this query, so it was blocked by the "
-            f"cost limit (max {max_query_cost:.2f}). If you really need to run it, "
-            f"call again with force=true."
-        )
+        return f"Could not estimate the cost of this query, so it was blocked by the cost limit (max {max_query_cost:.2f}). {cost_limit_advice()}"
 
     if cost > max_query_cost:
         return (
             f"Estimated query cost {cost:.2f} exceeds the configured limit of "
             f"{max_query_cost:.2f}. This query was blocked to protect the database. "
-            f"If you really need to run it, call again with force=true."
+            f"{cost_limit_advice()}"
         )
 
     return None
@@ -493,6 +507,10 @@ async def execute_sql(
 ) -> ResponseType:
     """Executes a SQL query against the database."""
     try:
+        # Checked before the cost limit and regardless of force: EXPLAIN prices a sleep at nothing.
+        if calls_sleep(sql):
+            return format_error_response(SLEEP_REJECTION)
+
         rejection = await enforce_cost_limit(sql, force)
         if rejection is not None:
             return format_error_response(rejection)
@@ -505,6 +523,13 @@ async def execute_sql(
     except Exception as e:
         logger.error(f"Error executing query: {e}")
         return format_error_response(str(e))
+
+
+async def execute_sql_without_force(
+    sql: str = Field(description="SQL to run", default="all"),
+) -> ResponseType:
+    """Executes a SQL query against the database."""
+    return await execute_sql(sql, force=False)
 
 
 @mcp.tool(
@@ -653,6 +678,17 @@ async def main():
         "EXPLAIN first and rejected if its estimated total cost exceeds this value (unless force=true is passed).",
     )
     parser.add_argument(
+        "--disallow-force",
+        action="store_true",
+        help="Remove the force parameter from execute_sql so the cost limit cannot be bypassed.",
+    )
+    parser.add_argument(
+        "--cost-limit-hint",
+        type=str,
+        default=None,
+        help="Text appended to cost-limit rejections when force is disallowed, e.g. where heavy queries should run instead.",
+    )
+    parser.add_argument(
         "--statement-timeout",
         type=float,
         default=20,
@@ -702,18 +738,24 @@ async def main():
     # Store the optional cost limit in the global variable
     global max_query_cost
     max_query_cost = args.max_query_cost
+    global allow_force, cost_limit_hint
+    allow_force = not args.disallow_force
+    cost_limit_hint = args.cost_limit_hint
 
     cost_limit_note = ""
     if max_query_cost is not None:
+        bypass = "pass force=true to run them anyway" if allow_force else cost_limit_advice().rstrip(".")
         cost_limit_note = (
             f" Queries whose estimated cost exceeds {max_query_cost:.2f} are blocked to protect the database; "
-            f"pass force=true to run them anyway. Queries reading only information_schema or pg_catalog are exempt."
+            f"{bypass}. Queries reading only information_schema or pg_catalog are exempt."
         )
+    query_tool = execute_sql if allow_force else execute_sql_without_force
 
     # Add the query tool with a description and annotations appropriate to the access mode
     if current_access_mode == AccessMode.UNRESTRICTED:
         mcp.add_tool(
-            execute_sql,
+            query_tool,
+            name="execute_sql",
             description="Execute any SQL query." + cost_limit_note,
             annotations=ToolAnnotations(
                 title="Execute SQL",
@@ -722,7 +764,8 @@ async def main():
         )
     else:
         mcp.add_tool(
-            execute_sql,
+            query_tool,
+            name="execute_sql",
             description="Execute a read-only SQL query." + cost_limit_note,
             annotations=ToolAnnotations(
                 title="Execute SQL (Read-Only)",
