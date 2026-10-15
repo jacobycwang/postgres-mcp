@@ -1,3 +1,4 @@
+import inspect
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -275,3 +276,108 @@ async def test_execute_sql_unestimatable_with_force_executes(mock_sql_driver):
 
     mock_sql_driver.execute_query.assert_awaited_once()
     assert "Error" not in text_of(result)
+
+
+# ---------------------------------------------------------------------------
+# force disallowed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_execute_sql_force_ignored_when_disallowed(mock_sql_driver):
+    """With force disallowed, force=true still goes through the cost check."""
+    with (
+        patch("postgres_mcp.server.max_query_cost", 1000.0),
+        patch("postgres_mcp.server.allow_force", False),
+        patch("postgres_mcp.server.get_sql_driver", new=AsyncMock(return_value=mock_sql_driver)),
+        patch("postgres_mcp.server.estimate_query_cost", new=AsyncMock(return_value=server.CostEstimate(cost=5000.0))),
+    ):
+        result = await server.execute_sql("SELECT * FROM huge_table", force=True)
+
+    mock_sql_driver.execute_query.assert_not_awaited()
+    assert "5000.00" in text_of(result)
+
+
+@pytest.mark.asyncio
+async def test_execute_sql_disallowed_rejection_shows_hint_not_force(mock_sql_driver):
+    """With force disallowed, a rejection points at the configured hint and never at force=true."""
+    hint = "Run heavy or analytical queries on the warehouse instead."
+    with (
+        patch("postgres_mcp.server.max_query_cost", 1000.0),
+        patch("postgres_mcp.server.allow_force", False),
+        patch("postgres_mcp.server.cost_limit_hint", hint),
+        patch("postgres_mcp.server.get_sql_driver", new=AsyncMock(return_value=mock_sql_driver)),
+        patch("postgres_mcp.server.estimate_query_cost", new=AsyncMock(return_value=server.CostEstimate(cost=5000.0))),
+    ):
+        over = text_of(await server.execute_sql("SELECT * FROM huge_table", force=False))
+
+    with (
+        patch("postgres_mcp.server.max_query_cost", 1000.0),
+        patch("postgres_mcp.server.allow_force", False),
+        patch("postgres_mcp.server.cost_limit_hint", hint),
+        patch("postgres_mcp.server.get_sql_driver", new=AsyncMock(return_value=mock_sql_driver)),
+        patch("postgres_mcp.server.estimate_query_cost", new=AsyncMock(return_value=server.CostEstimate())),
+    ):
+        unknown = text_of(await server.execute_sql("SELECT * FROM huge_table", force=False))
+
+    for message in (over, unknown):
+        assert hint in message
+        assert "force=true" not in message
+
+
+@pytest.mark.asyncio
+async def test_execute_sql_without_force_never_bypasses(mock_sql_driver):
+    """The tool registered when force is disallowed has no force parameter and is always cost checked."""
+    assert "force" not in inspect.signature(server.execute_sql_without_force).parameters
+    with (
+        patch("postgres_mcp.server.max_query_cost", 1000.0),
+        patch("postgres_mcp.server.allow_force", False),
+        patch("postgres_mcp.server.get_sql_driver", new=AsyncMock(return_value=mock_sql_driver)),
+        patch("postgres_mcp.server.estimate_query_cost", new=AsyncMock(return_value=server.CostEstimate(cost=5000.0))),
+    ):
+        result = await server.execute_sql_without_force("SELECT * FROM huge_table")
+
+    mock_sql_driver.execute_query.assert_not_awaited()
+    assert "5000.00" in text_of(result)
+
+
+# ---------------------------------------------------------------------------
+# pg_sleep
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT pg_sleep(45)::text s, (SELECT count(*) FROM reservation) n",
+        "SELECT pg_catalog.pg_sleep_for('1 minute') FROM pg_class LIMIT 1",
+    ],
+)
+async def test_execute_sql_rejects_sleep(mock_sql_driver, sql, force):
+    """pg_sleep is rejected before the cost check, even with force or on catalog-only queries."""
+    estimate = AsyncMock(return_value=server.CostEstimate(cost=1.0))
+    with (
+        patch("postgres_mcp.server.max_query_cost", 1000.0),
+        patch("postgres_mcp.server.get_sql_driver", new=AsyncMock(return_value=mock_sql_driver)),
+        patch("postgres_mcp.server.estimate_query_cost", new=estimate),
+    ):
+        result = await server.execute_sql(sql, force=force)
+
+    estimate.assert_not_called()
+    mock_sql_driver.execute_query.assert_not_awaited()
+    assert text_of(result) == f"Error: {server.SLEEP_REJECTION}"
+
+
+@pytest.mark.asyncio
+async def test_execute_sql_rejects_sleep_without_cost_limit(mock_sql_driver):
+    """pg_sleep is rejected even when no cost limit is configured."""
+    with (
+        patch("postgres_mcp.server.max_query_cost", None),
+        patch("postgres_mcp.server.get_sql_driver", new=AsyncMock(return_value=mock_sql_driver)),
+    ):
+        result = await server.execute_sql("SELECT pg_sleep(1)", force=False)
+
+    mock_sql_driver.execute_query.assert_not_awaited()
+    assert "pg_sleep is not allowed" in text_of(result)

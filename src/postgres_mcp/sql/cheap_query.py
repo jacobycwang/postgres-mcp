@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Iterator
 
 import pglast
 from pglast.ast import CommonTableExpr
+from pglast.ast import FuncCall
 from pglast.ast import Node
 from pglast.ast import RangeFunction
 from pglast.ast import RangeTableFunc
@@ -18,6 +20,8 @@ from pglast.ast import SelectStmt
 logger = logging.getLogger(__name__)
 
 CATALOG_SCHEMAS = frozenset({"information_schema", "pg_catalog"})
+SLEEP_FUNCTIONS = frozenset({"pg_sleep", "pg_sleep_for", "pg_sleep_until"})
+_SLEEP_PATTERN = re.compile(r"\bpg_sleep(_for|_until)?\s*\(", re.IGNORECASE)
 
 
 def _walk(node: Node) -> Iterator[Node]:
@@ -85,3 +89,27 @@ def is_catalog_only_query(sql: str) -> bool:
             relations.append(node)
 
     return bool(relations) and all(_is_catalog_relation(r, cte_names) for r in relations)
+
+
+def calls_sleep(sql: str) -> bool:
+    """Whether the SQL calls pg_sleep, pg_sleep_for or pg_sleep_until anywhere.
+
+    A sleep holds a connection and a backend for its whole duration while doing no
+    work, and the planner prices it at almost nothing, so no cost check catches it.
+    SQL that does not parse falls back to a textual match rather than letting it through.
+    """
+    try:
+        parsed = pglast.parse_sql(sql)
+    except Exception:
+        return bool(_SLEEP_PATTERN.search(sql))
+
+    for raw in parsed:
+        stmt = raw.stmt if isinstance(raw, RawStmt) else raw
+        if not isinstance(stmt, Node):
+            continue
+        for node in _walk(stmt):
+            if isinstance(node, FuncCall) and node.funcname:
+                name = getattr(node.funcname[-1], "sval", None)
+                if name and name.lower() in SLEEP_FUNCTIONS:
+                    return True
+    return False

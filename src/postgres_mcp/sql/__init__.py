@@ -3,6 +3,7 @@
 from .bind_params import ColumnCollector
 from .bind_params import SqlBindParams
 from .bind_params import TableAliasVisitor
+from .cheap_query import calls_sleep
 from .cheap_query import is_catalog_only_query
 from .extension_utils import check_extension
 from .extension_utils import check_hypopg_installation_status
@@ -23,6 +24,7 @@ __all__ = [
     "SqlBindParams",
     "SqlDriver",
     "TableAliasVisitor",
+    "calls_sleep",
     "check_extension",
     "check_hypopg_installation_status",
     "check_postgres_version_requirement",
